@@ -120,7 +120,7 @@ module top (
     // =====================================================================
     //  KEYBOARD POSITION AND SIZE  — edit KB_X / KB_Y to move the keyboard
     // =====================================================================
-    localparam [10:0] KB_X = 11'd45;    // left edge on screen
+    localparam [10:0] KB_X = 11'd45;     // left edge on screen
     localparam [10:0] KB_Y = 11'd450;   // top edge on screen
     localparam [10:0] KB_W = 11'd704;   // bounding box (keys end at x = 701)
     localparam [10:0] KB_H = 11'd144;   // bounding box (keys end at y = 141)
@@ -457,7 +457,7 @@ module top (
     // The keymap ROM (keymap.hex, built by tools/build_keymap.py) turns
     // {bank, shift, key id} into a rune code, so the legend drawn on a key and
     // the rune it will type always come from the same place.
-    localparam GLYPHS = 32;             // glyph slots in glyphs2.hex (match build_glyphs.py --count)
+    localparam GLYPHS = 512;            // glyph slots in glyphs2.hex (match bake_runes.py --count)
 
     localparam [6:0] BASE_R0 = 7'd0;    // function row   20 keys
     localparam [6:0] BASE_R1 = 7'd20;   // number row     21 keys
@@ -472,6 +472,21 @@ module top (
     localparam [6:0] KID_GAME = BASE_R0 + 7'd19;
     localparam [6:0] KID_SHL  = BASE_R4 + 7'd0;    // left Shift
     localparam [6:0] KID_SHR  = BASE_R4 + 7'd11;   // right Shift
+    localparam [6:0] KID_ESC  = BASE_R0 + 7'd0;
+    localparam [6:0] KID_BKSP = BASE_R1 + 7'd13;
+    localparam [6:0] KID_TAB  = BASE_R2 + 7'd0;
+    localparam [6:0] KID_DEL  = BASE_R2 + 7'd15;
+    localparam [6:0] KID_ENT  = BASE_R3 + 7'd12;
+    localparam [6:0] KID_UP   = BASE_R4 + 7'd12;
+    localparam [6:0] KID_NENT = BASE_R4 + 7'd16;   // numpad Enter
+    localparam [6:0] KID_SPC  = BASE_R5 + 7'd3;
+    localparam [6:0] KID_LEFT = BASE_R5 + 7'd8;
+    localparam [6:0] KID_DOWN = BASE_R5 + 7'd9;
+    localparam [6:0] KID_RGT  = BASE_R5 + 7'd10;
+
+    // glyph slot map (must match the rune generator)
+    localparam [9:0] UI_BASE  = 10'd135;   // 135..199 = legend-only symbols, never typed
+    localparam [9:0] VAR_BASE = 10'd200;   // 200.. = bank variants, typeable
 
     function [6:0] row_base;
         input [2:0] r;
@@ -517,7 +532,32 @@ module top (
     reg        shift_on  = 1'b0;         // latched, like Caps Lock
     reg        caps_on   = 1'b0;
     reg [1:0]  bank      = 2'd0;         // 0 none, 1 Win, 2 Ins, 3 Game  (one active at a time)
-    reg [9:0]  last_code = 10'h3FF;      // rune of the last key pressed (text buffer comes later)
+    reg [6:0]  caret     = 7'd0;         // text cell that the next rune goes into (row*16 + col)
+
+    // text buffer: 16 columns x 8 rows, one 10-bit rune per cell, 0x3FF = empty cell
+    reg [9:0]  tbuf [0:127];
+    integer    ti;
+    initial for (ti = 0; ti < 128; ti = ti + 1) tbuf[ti] = 10'h3FF;
+
+    // one registered write port (the cursor logic requests, this block performs)
+    reg        w_en   = 1'b0;
+    reg [6:0]  w_addr = 7'd0;
+    reg [9:0]  w_data = 10'h3FF;
+    reg        clr_req = 1'b0;          // Esc asks for a clear (one clock pulse from the cursor block)
+    reg        clr_on = 1'b0;            // sweep the whole buffer to empty (owned by this block only)
+    reg [6:0]  clr_i  = 7'd0;
+    always @(posedge clk_pixel) begin
+        if (clr_req) begin
+            clr_on <= 1'b1;
+            clr_i  <= 7'd0;
+        end else if (clr_on) begin
+            tbuf[clr_i] <= 10'h3FF;
+            clr_i <= clr_i + 7'd1;
+            if (clr_i == 7'd127) clr_on <= 1'b0;
+        end else if (w_en) begin
+            tbuf[w_addr] <= w_data;
+        end
+    end
 
     // nearest-key search for UP / DOWN: one candidate key per clock
     reg        searching = 1'b0;
@@ -539,6 +579,12 @@ module top (
     wire        cur_shift    = shift_on ^ (caps_on & kletter[cur_kid]);
     wire [9:0]  cur_code     = kmap[{bank, cur_shift, cur_kid}];
     wire        cur_code_ok  = (cur_code != 10'h3FF) && (cur_code < GLYPHS);
+    // a key types a rune only if its legend is a real rune (not a UI symbol)
+    wire        cur_typeable = cur_code_ok && ((cur_code < UI_BASE) || (cur_code >= VAR_BASE));
+
+    wire [6:0]  caret_next   = (caret == 7'd127) ? 7'd127 : caret + 7'd1;
+    wire [6:0]  tab_next     = (caret[6:2] == 5'd31) ? 7'd127 : {caret[6:2] + 5'd1, 2'b00};
+    wire [6:0]  enter_next   = (caret[6:4] == 3'd7) ? {3'd7, 4'd0} : {caret[6:4] + 3'd1, 4'd0};
 
     wire [4:0]  tgt_cnt  = row_count(tgt_row);
     wire [10:0] sk_cx    = key_cx(tgt_row, sk);
@@ -549,6 +595,8 @@ module top (
     // whose centre is nearest (takes about 20 clocks, presses are ignored meanwhile).
     // FIRE1 toggles Shift. FIRE2 presses the highlighted key.
     always @(posedge clk_pixel) begin
+        w_en    <= 1'b0;                            // default: no buffer write this clock
+        clr_req <= 1'b0;
         if (searching) begin
             if (sk < tgt_cnt) begin
                 if (sk == 5'd0 || sk_dist < best_dist) begin
@@ -588,7 +636,41 @@ module top (
                 else if (cur_kid == KID_INS)  bank <= (bank == 2'd2) ? 2'd0 : 2'd2;
                 else if (cur_kid == KID_GAME) bank <= (bank == 2'd3) ? 2'd0 : 2'd3;
                 else if (cur_kid == KID_SHL || cur_kid == KID_SHR) shift_on <= ~shift_on;
-                else if (cur_code_ok) last_code <= cur_code;
+                else if (cur_kid == KID_ESC) begin          // clear everything
+                    clr_req <= 1'b1;
+                    caret   <= 7'd0;
+                end
+                else if (cur_kid == KID_BKSP) begin         // erase the cell before the caret
+                    if (caret != 7'd0) begin
+                        caret  <= caret - 7'd1;
+                        w_en   <= 1'b1;
+                        w_addr <= caret - 7'd1;
+                        w_data <= 10'h3FF;
+                    end
+                end
+                else if (cur_kid == KID_DEL) begin          // erase the caret cell, stay
+                    w_en   <= 1'b1;
+                    w_addr <= caret;
+                    w_data <= 10'h3FF;
+                end
+                else if (cur_kid == KID_SPC) begin          // blank cell, advance
+                    w_en   <= 1'b1;
+                    w_addr <= caret;
+                    w_data <= 10'h3FF;
+                    caret  <= caret_next;
+                end
+                else if (cur_kid == KID_ENT || cur_kid == KID_NENT) caret <= enter_next;
+                else if (cur_kid == KID_TAB)  caret <= tab_next;
+                else if (cur_kid == KID_LEFT) begin if (caret != 7'd0)   caret <= caret - 7'd1; end
+                else if (cur_kid == KID_RGT)  caret <= caret_next;
+                else if (cur_kid == KID_UP)   begin if (caret >= 7'd16)  caret <= caret - 7'd16; end
+                else if (cur_kid == KID_DOWN) begin if (caret <  7'd112) caret <= caret + 7'd16; end
+                else if (cur_typeable) begin                // type the rune
+                    w_en   <= 1'b1;
+                    w_addr <= caret;
+                    w_data <= cur_code;
+                    caret  <= caret_next;
+                end
             end
         end
     end
@@ -663,29 +745,54 @@ module top (
         .data_b (rom_data_prev)
     );
 
-    // ---------- large digit preview (absolute screen position) ----------
-    localparam [10:0] RUNE_OX = 11'd200;
-    localparam [10:0] RUNE_OY = 11'd20;
+    // ---------- text area: 16 x 8 cells of 32x32 runes, 1:1 ----------
+    localparam [10:0] TX = 11'd144;
+    localparam [10:0] TY = 11'd20;
 
-    // the preview shows the rune of the highlighted key (blank if it has none)
-    wire        rune_in;
-    wire [7:0]  rune_r, rune_g, rune_b;
-    rune_draw #(.SCALE(8)) rune_i (
+    // Everything here is computed for the NEXT pixel (nx), because the glyph ROM
+    // output is registered; the flags are then registered so they line up.
+    wire [10:0] t_nx   = h_cnt + 11'd1;
+    wire [10:0] t_dx   = t_nx - TX;
+    wire [10:0] t_dy   = v_cnt - TY;
+    wire        t_in_n = (t_nx >= TX) && (t_dx < 11'd512) && (v_cnt >= TY) && (t_dy < 11'd256);
+    wire [6:0]  t_cell = {t_dy[7:5], t_dx[8:5]};
+    wire [10:0] t_ox   = TX + {2'b00, t_dx[8:5], 5'b0};
+    wire [10:0] t_oy   = TY + {3'b000, t_dy[7:5], 5'b0};
+
+    // the caret cell shows a ghost of the rune the highlighted key would type
+    wire        t_is_caret = (t_cell == caret);
+    wire [9:0]  t_code = (t_is_caret && cur_typeable) ? cur_code : tbuf[t_cell];
+    wire        t_ok_n = (t_code != 10'h3FF) && (t_code < GLYPHS);
+
+    reg t_in_r = 1'b0, t_caret_r = 1'b0, t_ok_r = 1'b0;
+    always @(posedge clk_pixel) begin
+        t_in_r    <= t_in_n;
+        t_caret_r <= t_is_caret;
+        t_ok_r    <= t_ok_n;
+    end
+
+    localparam [23:0] COL_TBG   = 24'hFFFFFF;
+    localparam [23:0] COL_CARET = 24'hF6DDD2;
+
+    wire        text_view;
+    wire [7:0]  text_r, text_g, text_b;
+    rune_draw #(.SCALE(2)) text_i (
         .clk      (clk_pixel),
-        .code     (cur_code),
+        .code     (t_code),
         .px       (h_cnt),
         .py       (v_cnt),
-        .origin_x (RUNE_OX),
-        .origin_y (RUNE_OY),
-        .bg_rgb   (COL_BG),
+        .origin_x (t_ox),
+        .origin_y (t_oy),
+        .bg_rgb   (t_caret_r ? COL_CARET : COL_TBG),
         .rom_addr (rom_addr_prev),
         .rom_data (rom_data_prev),
-        .in_view  (rune_in),
-        .out_r    (rune_r),
-        .out_g    (rune_g),
-        .out_b    (rune_b)
+        .in_view  (text_view),
+        .out_r    (text_r),
+        .out_g    (text_g),
+        .out_b    (text_b)
     );
-    wire show_rune = rune_in && cur_code_ok;
+    wire [23:0] text_bg  = t_caret_r ? COL_CARET : COL_TBG;
+    wire [23:0] text_rgb = (text_view && t_ok_r) ? {text_r, text_g, text_b} : text_bg;
 
     // ---------- shared key-glyph renderer (legend comes from the keymap ROM) ----------
     // The glyph sits inside the key: 1 px in on the function row, 2 px elsewhere.
@@ -713,7 +820,7 @@ module top (
 
     // ---------- final pixel ----------
     wire [23:0] pix_rgb =
-        show_rune      ? {rune_r,     rune_g,     rune_b}     :
+        t_in_r         ? text_rgb :
         show_key_glyph ? {key_rune_r, key_rune_g, key_rune_b} :
         led_hit        ? led_col :
         is_selected    ? COL_HI  :

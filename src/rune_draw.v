@@ -23,7 +23,8 @@ module rune_draw #(
     output wire [7:0]  out_g,
     output wire [7:0]  out_b
 );
-    localparam VIEW = (SCALE == 8) ? 256 : 16;
+    // SCALE=2 -> 32x32 at 1:1 (text cells)
+    localparam VIEW = (SCALE == 8) ? 256 : (SCALE == 2) ? 32 : 16;
 
     // Look up the NEXT pixel so the registered ROM data lines up with the
     // current pixel.
@@ -34,8 +35,8 @@ module rune_draw #(
     wire in_view_next = (nx >= origin_x) && (nx < origin_x + VIEW) &&
                         (py >= origin_y) && (py < origin_y + VIEW);
 
-    wire [4:0] src_x = (SCALE == 8) ? rel_x[7:3] : {rel_x[3:0], 1'b0};
-    wire [4:0] src_y = (SCALE == 8) ? rel_y[7:3] : {rel_y[3:0], 1'b0};
+    wire [4:0] src_x = (SCALE == 8) ? rel_x[7:3] : (SCALE == 2) ? rel_x[4:0] : {rel_x[3:0], 1'b0};
+    wire [4:0] src_y = (SCALE == 8) ? rel_y[7:3] : (SCALE == 2) ? rel_y[4:0] : {rel_y[3:0], 1'b0};
 
     assign rom_addr = {code, src_y, src_x};
 
